@@ -4,6 +4,7 @@
              [string :as str]]
             [clojure.java.jdbc :as jdbc]
             [honeysql.core :as hsql]
+            [java-time :as t]
             [metabase.driver :as driver]
             [metabase.driver.common :as driver.common]
             [metabase.driver.sql-jdbc
@@ -14,7 +15,8 @@
             [metabase.util
              [honeysql-extensions :as hx]
              [ssh :as ssh]])
-  (:import [java.sql DatabaseMetaData Time]))
+  (:import [java.sql DatabaseMetaData Time]
+           [java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime]))
 
 (driver/register! :firebird, :parent :sql-jdbc)
 
@@ -39,7 +41,6 @@
       firebird->spec
       (sql-jdbc.common/handle-additional-options details)))
 
-;; Use "SELECT 1 FROM RDB$DATABASE" instead of "SELECT 1"
 (defmethod driver/can-connect? :firebird [driver details]
   (let [connection (sql-jdbc.conn/connection-details->spec driver (ssh/include-ssh-tunnel details))]
     (= 1 (first (vals (first (jdbc/query connection ["SELECT 1 FROM RDB$DATABASE"])))))))
@@ -79,22 +80,11 @@
                                            items
                                            (* items (dec page)))]))
 
-;; Firebird stores table names as CHAR(31), so names with < 31 characters get padded with spaces.
-;; This confuses everyone, including metabase, so we trim the table names here
-(defn post-filtered-trimmed-active-tables
-  "Alternative implementation of `ISQLDriver/active-tables` best suited for DBs with little or no support for schemas.
-   Fetch *all* Tables, then filter out ones whose schema is in `excluded-schemas` Clojure-side."
-  [driver, ^DatabaseMetaData metadata, & [db-name-or-nil]]
-  (set (for [table (sql-jdbc.sync/post-filtered-active-tables driver metadata db-name-or-nil)]
-         {:name         (str/trim (:name  table))
-          :description  (:description     table)
-          :schema       (:schema          table)})))
-
 (defmethod sql-jdbc.sync/active-tables :firebird [& args]
-  (apply post-filtered-trimmed-active-tables args))
+  (apply sql-jdbc.sync/post-filtered-active-tables args))
 
 ;; Convert unix time to a timestamp
-(defmethod sql.qp/unix-timestamp->timestamp [:firebird :seconds] [_ _ expr]
+(defmethod sql.qp/unix-timestamp->honeysql [:firebird :seconds] [_ _ expr]
   (hsql/call :DATEADD (hsql/raw "SECOND") expr (hx/cast :TIMESTAMP (hx/literal "01-01-1970 00:00:00"))))
 
 ;; Helpers for Date extraction
@@ -163,12 +153,12 @@
 (defmethod sql.qp/date [:firebird :quarter-of-year] [_ _ expr] (hx/+ (hx// (hx/- (hsql/call :extract :MONTH expr) 1) 3) 1))
 (defmethod sql.qp/date [:firebird :year]            [_ _ expr] (hsql/call :extract :YEAR expr))
 
-(defmethod driver/date-add :firebird [driver dt amount unit]
+(defmethod sql.qp/add-interval-honeysql-form :firebird [driver hsql-form amount unit]
   (if (= unit :quarter)
-    (recur driver dt (hx/* amount 3) :month)
-    (hsql/call :dateadd (hsql/raw (name unit)) amount dt)))
+    (recur driver hsql-form (hx/* amount 3) :month)
+    (hsql/call :dateadd (hsql/raw (name unit)) amount hsql-form)))
 
-(defmethod sql.qp/current-datetime-fn :firebird [_]
+(defmethod sql.qp/current-datetime-honeysql-form :firebird [_]
   (hx/cast :timestamp (hx/literal :now)))
 
 (defmethod driver.common/current-db-time-date-formatters :firebird [_]
@@ -184,6 +174,41 @@
   [driver [_ field]]
   (hsql/call :stddev_samp (sql.qp/->honeysql driver field)))
 
+;; MEGA HACK based on sqlite driver
+
+(defn- zero-time? [t]
+  (= (t/local-time t) (t/local-time 0)))
+
+(defmethod sql.qp/->honeysql [:firebird LocalDate]
+  [_ t]
+  (hx/cast :DATE (t/format "yyyy-MM-dd" t)))
+
+(defmethod sql.qp/->honeysql [:firebird LocalDateTime]
+  [driver t]
+  (if (zero-time? t)
+    (sql.qp/->honeysql driver (t/local-date t))
+    (hx/cast :TIMESTAMP (t/format "yyyy-MM-dd HH:mm:ss.SSSS" t))))
+
+(defmethod sql.qp/->honeysql [:firebird LocalTime]
+  [_ t]
+  (hx/cast :TIME (t/format "HH:mm:ss.SSSS" t)))
+
+(defmethod sql.qp/->honeysql [:firebird OffsetDateTime]
+  [driver t]
+  (if (zero-time? t)
+    (sql.qp/->honeysql driver (t/local-date t))
+    (hx/cast :TIMESTAMP (t/format "yyyy-MM-dd HH:mm:ss.SSSS" t))))
+
+(defmethod sql.qp/->honeysql [:firebird OffsetTime]
+  [_ t]
+  (hx/cast :TIME (t/format "HH:mm:ss.SSSS" t)))
+
+(defmethod sql.qp/->honeysql [:firebird ZonedDateTime]
+  [driver t]
+  (if (zero-time? t)
+    (sql.qp/->honeysql driver (t/local-date t))
+    (hx/cast :TIMESTAMP (t/format "yyyy-MM-dd HH:mm:ss.SSSS" t))))
+
 (defmethod driver/supports? [:firebird :basic-aggregations]  [_ _] true)
 
 (defmethod driver/supports? [:firebird :expression-aggregations]  [_ _] true)
@@ -196,7 +221,7 @@
 
 (defmethod driver/supports? [:firebird :set-timezone]  [_ _] false)
 
-(defmethod driver/supports? [:firebird :nested-queries]  [_ _] false)
+(defmethod driver/supports? [:firebird :nested-queries]  [_ _] true)
 
 (defmethod driver/supports? [:firebird :binning]  [_ _] false)
 
